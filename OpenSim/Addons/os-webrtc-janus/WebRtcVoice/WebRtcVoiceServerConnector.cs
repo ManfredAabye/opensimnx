@@ -26,6 +26,7 @@
  */
 
 using System;
+using System.Net;
 using System.Reflection;
 
 using OpenSim.Framework;
@@ -42,7 +43,7 @@ using OpenMetaverse.StructuredData;
 using log4net;
 using Nini.Config;
 
-namespace osWebRtcVoice
+namespace WebRtcVoice
 {
     // Class that provides the network interface to the WebRTC voice server.
     // This is used by the Robust server to receive requests from the region servers
@@ -58,6 +59,8 @@ namespace osWebRtcVoice
 
         public WebRtcVoiceServerConnector(IConfigSource pConfig, IHttpServer pServer, string pConfigName)
         {
+            WebRtcDebugControl.ApplyFromConfig(pConfig);
+
             IConfig moduleConfig = pConfig.Configs["WebRtcVoice"];
 
             if (moduleConfig is not null)
@@ -72,18 +75,21 @@ namespace osWebRtcVoice
                     // The local service provides  the IWebRtcVoiceService interface and directs the requests
                     //   to the WebRTC service.
                     string localServiceModule = moduleConfig.GetString("LocalServiceModule", "WebRtcVoiceServiceModule.dll:WebRtcVoiceServiceModule");
+                    m_log.DebugFormat("{0} loading {1}", LogHeader, localServiceModule);
 
-                    m_log.Debug($"{LogHeader} loading {localServiceModule}");
-                    m_WebRtcVoiceService = ServerUtils.LoadPlugin<IWebRtcVoiceService>(localServiceModule, [pConfig]);
+                    object[] args = new object[0];
+                    m_WebRtcVoiceService = ServerUtils.LoadPlugin<IWebRtcVoiceService>(localServiceModule, args); 
 
                     // The WebRtcVoiceServiceModule is both an IWebRtcVoiceService and a ISharedRegionModule
                     //     so we can initialize it as if it was the region module.
-                    if (m_WebRtcVoiceService is not IWebRtcVoiceService voiceservice)
+                    ISharedRegionModule sharedModule = m_WebRtcVoiceService as ISharedRegionModule;
+                    if (sharedModule is null)
                     {
                         m_log.ErrorFormat("{0} local service module does not implement ISharedRegionModule", LogHeader);
                         m_Enabled = false;
                         return;
                     }
+                    sharedModule.Initialise(pConfig);
 
                     // Now that we have someone to handle the requests, we can set up the handlers
                     pServer.AddJsonRPCHandler("provision_voice_account_request", Handle_ProvisionVoiceAccountRequest);
@@ -95,20 +101,14 @@ namespace osWebRtcVoice
         private bool Handle_ProvisionVoiceAccountRequest(OSDMap pJson, ref JsonRpcResponse pResponse)
         {
             bool ret = false;
-            m_log.Debug($"{LogHeader} Handle_ProvisionVoiceAccountRequest");
+            m_log.DebugFormat("{0} Handle_ProvisionVoiceAccountRequest", LogHeader);
             if (m_MessageDetails) m_log.DebugFormat("{0} PVAR: req={1}", LogHeader, pJson.ToString());
 
-            if (pJson.TryGetOSDMap("params", out OSDMap paramsMap))
+            if (pJson.ContainsKey("params") && pJson["params"] is OSDMap paramsMap)
             {
-                OSDMap request = paramsMap.TryGetOSDMap("request", out OSDMap treq) ? treq : null;
-                if(request is null)
-                {
-                    m_log.Error($"{LogHeader} PVAR: invalid parameter 'request'");
-                    return false;
-                }
-
-                UUID userID = paramsMap.TryGetUUID("userID", out UUID tuserid) ? tuserid : UUID.Zero;
-                UUID sceneID = paramsMap.TryGetUUID("scene", out UUID tsceneid) ? tsceneid : UUID.Zero;
+                OSDMap request = paramsMap.ContainsKey("request") ? paramsMap["request"] as OSDMap : null;
+                UUID userID = paramsMap.ContainsKey("userID") ? paramsMap["userID"].AsUUID() : UUID.Zero;
+                UUID sceneID = paramsMap.ContainsKey("scene") ? paramsMap["scene"].AsUUID() : UUID.Zero;
 
                 try
                 {
@@ -117,69 +117,58 @@ namespace osWebRtcVoice
                         m_log.ErrorFormat("{0} PVAR: no local service", LogHeader);
                         return false;
                     }
+                    OSDMap resp = m_WebRtcVoiceService.ProvisionVoiceAccountRequest(request, userID, sceneID).GetAwaiter().GetResult();
 
-                    OSDMap resp = m_WebRtcVoiceService.ProvisionVoiceAccountRequest(request, userID, sceneID);
-
-                    pResponse = new JsonRpcResponse
-                    {
-                        Result = resp
-                    };
-
+                    pResponse = new JsonRpcResponse();
+                    pResponse.Result = resp;
                     if (m_MessageDetails) m_log.DebugFormat("{0} PVAR: resp={1}", LogHeader, resp.ToString());
                     ret = true;
                 }
                 catch (Exception e)
                 {
-                    m_log.Error($"{LogHeader} PVAR: exception ", e);
+                    m_log.ErrorFormat("{0} PVAR: exception {1}", LogHeader, e);
                 }   
             }
             else
             {
-                m_log.Error($"{LogHeader} PVAR: missing parameters");
+                m_log.ErrorFormat("{0} PVAR: missing parameters", LogHeader);
             }
             return ret;
         }
 
         private bool Handle_VoiceSignalingRequest(OSDMap pJson, ref JsonRpcResponse pResponse)
         {
-            if (pJson.TryGetOSDMap("params", out OSDMap paramsMap))
+            bool ret = false;
+            if (pJson.ContainsKey("params") && pJson["params"] is OSDMap paramsMap)
             {
-                m_log.Debug($"{LogHeader} Handle_VoiceSignalingRequest");
-                if (m_MessageDetails) m_log.Debug($"{LogHeader} VSR: req={paramsMap}");
+                m_log.DebugFormat("{0} Handle_VoiceSignalingRequest", LogHeader);
+                if (m_MessageDetails) m_log.DebugFormat("{0} VSR: req={1}", LogHeader, paramsMap.ToString());
 
-                OSDMap request = paramsMap.TryGetOSDMap("request", out OSDMap treq) ? treq : null;
-                if(request is null)
-                {
-                    m_log.Error($"{LogHeader} VSR: null parameter 'request'");
-                    return false;
-                }
-
-                UUID userID = paramsMap.TryGetUUID("userID", out UUID tuserid) ? tuserid : UUID.Zero;
-                UUID sceneID = paramsMap.TryGetUUID("scene", out UUID tsceneid) ? tsceneid : UUID.Zero;
+                OSDMap request = paramsMap.ContainsKey("request") ? paramsMap["request"] as OSDMap : null;
+                UUID userID = paramsMap.ContainsKey("userID") ? paramsMap["userID"].AsUUID() : UUID.Zero;
+                UUID sceneID = paramsMap.ContainsKey("scene") ? paramsMap["scene"].AsUUID() : UUID.Zero;
 
                 try
                 {
-                    OSDMap resp = m_WebRtcVoiceService.VoiceSignalingRequest(request, userID, sceneID);
+                    OSDMap resp = m_WebRtcVoiceService.VoiceSignalingRequest(request, userID, sceneID).GetAwaiter().GetResult();
 
-                    pResponse = new JsonRpcResponse
-                    {
-                        Result = resp
-                    };
-                    if (m_MessageDetails) m_log.Debug($"{LogHeader} VSR: resp={resp}");
+                    pResponse = new JsonRpcResponse();
+                    pResponse.Result = resp;
+                    if (m_MessageDetails) m_log.DebugFormat("{0} VSR: resp={1}", LogHeader, resp.ToString());
 
-                    return true;
+                    ret = true;
                 }
                 catch (Exception e)
                 {
-                    m_log.Error($"{LogHeader} VSR: exception ", e);
+                    m_log.ErrorFormat("{0} VSR: exception {1}", LogHeader, e);
                 }
             }
             else
             {
-                m_log.Error($"{LogHeader} VSR: missing parameters");
+                m_log.ErrorFormat("{0} VSR: missing parameters", LogHeader);
             }
 
-            return false;
+            return ret;
         }
     }
 }

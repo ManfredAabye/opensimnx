@@ -28,12 +28,20 @@
 using System;
 using System.Reflection;
 
-using OpenMetaverse.StructuredData;
+using OpenSim.Framework;
+using OpenSim.Services.Interfaces;
+using OpenSim.Services.Base;
 
+using OpenMetaverse.StructuredData;
+using OpenMetaverse;
+
+using Nini.Config;
 using log4net;
 using System.Threading.Tasks;
+using System.Text.RegularExpressions;
+using System.Collections.Generic;
 
-namespace osWebRtcVoice
+namespace WebRtcVoice
 {
     // Encapsulization of a Session to the Janus server
     public class JanusRoom : IDisposable
@@ -59,6 +67,7 @@ namespace osWebRtcVoice
 
         public async Task<bool> JoinRoom(JanusViewerSession pVSession)
         {
+            bool ret = false;
             try
             {
                 // m_log.DebugFormat("{0} JoinRoom. New joinReq for room {1}", LogHeader, RoomId);
@@ -67,46 +76,55 @@ namespace osWebRtcVoice
                 //    and, if removed, the viewer complains that the "m=" sections are
                 //    out of order. Not "cleaning" (removing the data section) seems to work.
                 // string cleanSdp = CleanupSdp(pSdp);
-                AudioBridgeAgentJoinRoomReq joinReq = new(RoomId, pVSession.AgentId);
+                var joinReq = new AudioBridgeJoinRoomReq(RoomId, pVSession.AgentId.ToString());
                 // joinReq.SetJsep("offer", cleanSdp);
                 joinReq.SetJsep("offer", pVSession.Offer);
 
-                JanusMessageResp resp = await _AudioBridge.SendPluginMsg(joinReq).ConfigureAwait(false);
-                AudioBridgeJoinRoomResp joinResp = new(resp);
+                JanusMessageResp resp = await _AudioBridge.SendPluginMsg(joinReq);
+                AudioBridgeJoinRoomResp joinResp = new AudioBridgeJoinRoomResp(resp);
 
                 if (joinResp is not null && joinResp.AudioBridgeReturnCode == "joined" && joinResp.ParticipantId > 0)
                 {
                     pVSession.ParticipantId = joinResp.ParticipantId;
                     pVSession.Answer = joinResp.Jsep;
-                    m_log.Debug($"{LogHeader} JoinRoom. Joined room {RoomId}. Participant={pVSession.ParticipantId}");
-                    return true;
+                    ret = true;
+                    m_log.DebugFormat("{0} JoinRoom. Joined room {1}. Participant={2}", LogHeader, RoomId, pVSession.ParticipantId);
                 }
-                
-                if (joinResp is not null && (joinResp.AudioBridgeErrorCode == 490 || joinResp.AudioBridgeErrorCode == 491))
+                else if (joinResp is not null && joinResp.AudioBridgeErrorCode == 491)
                 {
-                    m_log.Warn($"{LogHeader} JoinRoom. Already in a room for agent {pVSession.AgentId}. Attempting recovery.");
+                    m_log.WarnFormat("{0} JoinRoom. Already in a room for agent {1}. Attempting recovery.",
+                            LogHeader, pVSession.AgentId);
 
-                    bool recovered = await RecoverAlreadyInRoomAndLeave(pVSession.AgentId.ToString()).ConfigureAwait(false);
+                    bool recovered = await RecoverAlreadyInRoomAndLeave(pVSession.AgentId.ToString());
                     if (recovered)
                     {
-                        AudioBridgeAgentJoinRoomReq retryJoinReq = new(RoomId, pVSession.AgentId);
+                        var retryJoinReq = new AudioBridgeJoinRoomReq(RoomId, pVSession.AgentId.ToString());
                         retryJoinReq.SetJsep("offer", pVSession.Offer);
-                        JanusMessageResp retryResp = await _AudioBridge.SendPluginMsg(retryJoinReq).ConfigureAwait(false);
-                        AudioBridgeJoinRoomResp retryJoinResp = new(retryResp);
+                        JanusMessageResp retryResp = await _AudioBridge.SendPluginMsg(retryJoinReq);
+                        AudioBridgeJoinRoomResp retryJoinResp = new AudioBridgeJoinRoomResp(retryResp);
 
                         if (retryJoinResp is not null && retryJoinResp.AudioBridgeReturnCode == "joined" && retryJoinResp.ParticipantId > 0)
                         {
                             pVSession.ParticipantId = retryJoinResp.ParticipantId;
                             pVSession.Answer = retryJoinResp.Jsep;
-                            m_log.Info($"{LogHeader} JoinRoom. Recovery succeeded for room {RoomId}. Participant={pVSession.ParticipantId}");
-                            return true;
+                            ret = true;
+                            m_log.InfoFormat("{0} JoinRoom. Recovery succeeded for room {1}. Participant={2}",
+                                    LogHeader, RoomId, pVSession.ParticipantId);
                         }
-
-                        m_log.Error($"{LogHeader} JoinRoom. Recovery retry failed for room {RoomId}. Resp={retryJoinResp?.ToString() ?? "null"}");
+                        else
+                        {
+                            m_log.ErrorFormat("{0} JoinRoom. Recovery retry failed for room {1}",
+                                    LogHeader, RoomId);
+                            if (m_log.IsDebugEnabled)
+                                m_log.DebugFormat("{0} JoinRoom. Recovery retry detail: {1}", LogHeader, retryJoinResp?.ToString() ?? "null");
+                        }
                     }
                     else
                     {
-                        m_log.Error($"{LogHeader} JoinRoom. Recovery failed: could not clear previous room membership. Resp={joinResp}");
+                        m_log.ErrorFormat("{0} JoinRoom. Recovery failed: could not clear previous room membership",
+                                LogHeader);
+                        if (m_log.IsDebugEnabled)
+                            m_log.DebugFormat("{0} JoinRoom. Recovery failed detail: {1}", LogHeader, joinResp.ToString());
                     }
                 }
                 else
@@ -118,26 +136,23 @@ namespace osWebRtcVoice
                         if (m_log.IsDebugEnabled)
                             m_log.DebugFormat("{0} JoinRoom. Invalid participant detail: {1}", LogHeader, joinResp.ToString());
                     }
-                    else
-                    {
-                        m_log.ErrorFormat("{0} JoinRoom. Failed to join room {1}", LogHeader, RoomId);
-                        if (m_log.IsDebugEnabled)
-                            m_log.DebugFormat("{0} JoinRoom. Failure detail: {1}", LogHeader, joinResp?.ToString() ?? "null");
-                    }
+                    m_log.ErrorFormat("{0} JoinRoom. Failed to join room {1}", LogHeader, RoomId);
+                    if (m_log.IsDebugEnabled)
+                        m_log.DebugFormat("{0} JoinRoom. Failure detail: {1}", LogHeader, joinResp?.ToString() ?? "null");
                 }
             }
             catch (Exception e)
             {
-                m_log.Error($"{LogHeader} JoinRoom. Exception ", e);
+                m_log.ErrorFormat("{0} JoinRoom. Exception {1}", LogHeader, e);
             }
-            return false;
+            return ret;
         }
 
         private async Task<bool> RecoverAlreadyInRoomAndLeave(string pDisplay)
         {
             try
             {
-                JanusMessageResp listRoomsRespRaw = await _AudioBridge.SendPluginMsg(new AudioBridgeListRoomsReq()).ConfigureAwait(false);
+                JanusMessageResp listRoomsRespRaw = await _AudioBridge.SendPluginMsg(new AudioBridgeListRoomsReq());
                 AudioBridgeResp listRoomsResp = new AudioBridgeResp(listRoomsRespRaw);
                 if (listRoomsResp?.PluginRespData is null ||
                     !listRoomsResp.PluginRespData.TryGetValue("list", out OSD roomListNode) ||
@@ -153,10 +168,10 @@ namespace osWebRtcVoice
                         continue;
 
                     int roomId = roomIdNode.AsInteger();
-//                    if (roomId <= 0)
-//                        continue;
+                    if (roomId <= 0)
+                        continue;
 
-                    JanusMessageResp listParticipantsRespRaw = await _AudioBridge.SendPluginMsg(new AudioBridgeListParticipantsReq(roomId)).ConfigureAwait(false);
+                    JanusMessageResp listParticipantsRespRaw = await _AudioBridge.SendPluginMsg(new AudioBridgeListParticipantsReq(roomId));
                     AudioBridgeResp listParticipantsResp = new AudioBridgeResp(listParticipantsRespRaw);
                     if (listParticipantsResp?.PluginRespData is null ||
                         !listParticipantsResp.PluginRespData.TryGetValue("participants", out OSD participantsNode) ||
@@ -168,16 +183,16 @@ namespace osWebRtcVoice
                         if (participantNode is not OSDMap participant)
                             continue;
 
-                        string display = participant.TryGetValue("display", out OSD displayNode) ? displayNode.AsString() : string.Empty;
-                        if (!string.Equals(display, pDisplay, StringComparison.Ordinal))
+                        string display = participant.TryGetValue("display", out OSD displayNode) ? displayNode.AsString() : String.Empty;
+                        if (!String.Equals(display, pDisplay, StringComparison.Ordinal))
                             continue;
 
-                        long participantId = participant.TryGetValue("id", out OSD idNode) ? idNode.AsLong() : 0L;
+                        long participantId = participant.TryGetValue("id", out OSD idNode) ? JanusMessage.OSDToLong(idNode) : 0L;
                         if (participantId <= 0)
                             continue;
 
-                        JanusMessageResp leaveRespRaw = await _AudioBridge.SendPluginMsg(new AudioBridgeLeaveRoomReq(roomId, participantId)).ConfigureAwait(false);
-                        AudioBridgeResp leaveResp = new(leaveRespRaw);
+                        JanusMessageResp leaveRespRaw = await _AudioBridge.SendPluginMsg(new AudioBridgeLeaveRoomReq(roomId, participantId));
+                        AudioBridgeResp leaveResp = new AudioBridgeResp(leaveRespRaw);
 
                         if (leaveResp is not null)
                         {
@@ -187,7 +202,8 @@ namespace osWebRtcVoice
 
                             if (errorCode == 0 || abCode == "left" || abCode == "event" || janusCode == "ack")
                             {
-                                m_log.Info($"{LogHeader} RecoverAlreadyInRoomAndLeave. Cleared stale participant {participantId} from room {roomId}");
+                                m_log.InfoFormat("{0} RecoverAlreadyInRoomAndLeave. Cleared stale participant {1} from room {2}.",
+                                        LogHeader, participantId, roomId);
                                 return true;
                             }
                         }
@@ -196,7 +212,7 @@ namespace osWebRtcVoice
             }
             catch (Exception e)
             {
-                m_log.Error($"{LogHeader} RecoverAlreadyInRoomAndLeave. Exception ", e);
+                m_log.ErrorFormat("{0} RecoverAlreadyInRoomAndLeave. Exception {1}", LogHeader, e);
             }
 
             return false;
@@ -221,46 +237,55 @@ namespace osWebRtcVoice
 
         public async Task<bool> LeaveRoom(JanusViewerSession pAttendeeSession)
         {
+            bool ret = false;
             try
             {
                 JanusMessageResp resp = await _AudioBridge.SendPluginMsg(
-                    new AudioBridgeLeaveRoomReq(RoomId, pAttendeeSession.ParticipantId)).ConfigureAwait(false);
+                    new AudioBridgeLeaveRoomReq(RoomId, pAttendeeSession.ParticipantId));
 
                 if (resp is null)
                 {
-                    m_log.Error($"{LogHeader} LeaveRoom. Null response for room {RoomId}, participant={pAttendeeSession.ParticipantId}");
+                    m_log.ErrorFormat("{0} LeaveRoom. Null response for room {1}, participant={2}",
+                            LogHeader, RoomId, pAttendeeSession.ParticipantId);
                     return false;
                 }
 
-                AudioBridgeResp abResp = new(resp);
+                AudioBridgeResp abResp = new AudioBridgeResp(resp);
                 string returnCode = abResp.AudioBridgeReturnCode;
                 string janusReturnCode = resp.ReturnCode;
                 int errorCode = abResp.AudioBridgeErrorCode;
+                bool isBenignAlreadyLeft =
+                    errorCode == 487 &&
+                    (returnCode == "event" || janusReturnCode == "event" || janusReturnCode == "ack");
 
                 if (errorCode == 0 &&
                     (abResp.isSuccess || returnCode == "left" || returnCode == "event" || returnCode == "success" || janusReturnCode == "ack"))
                 {
-                    if (janusReturnCode == "ack" && string.IsNullOrEmpty(returnCode))
+                    ret = true;
+                    if (janusReturnCode == "ack" && String.IsNullOrEmpty(returnCode))
                     {
-                        m_log.Debug($"{LogHeader} LeaveRoom. Ack for room {RoomId}, participant={pAttendeeSession.ParticipantId}");
+                        m_log.DebugFormat("{0} LeaveRoom. Ack accepted for room {1}, participant={2}",
+                                LogHeader, RoomId, pAttendeeSession.ParticipantId);
                     }
-                    return true;
                 }
-
-                if (errorCode == 487 &&
-                    (returnCode == "event" || janusReturnCode == "event" || janusReturnCode == "ack"))
+                    else if (isBenignAlreadyLeft)
+                    {
+                        ret = true;
+                        m_log.InfoFormat("{0} LeaveRoom. Participant already left room {1}, participant={2} (errorCode=487)",
+                            LogHeader, RoomId, pAttendeeSession.ParticipantId);
+                    }
+                else
                 {
-                    m_log.Info($"{LogHeader} LeaveRoom. Participant already left room {RoomId}, participant={pAttendeeSession.ParticipantId} (errorCode=487)");
-                    return true;
+                    m_log.ErrorFormat("{0} LeaveRoom. Failed room {1}, participant={2}, janus={3}, audiobridge={4}, errorCode={5}",
+                            LogHeader, RoomId, pAttendeeSession.ParticipantId, janusReturnCode, returnCode, errorCode);
                 }
-
-                m_log.Error($"{LogHeader} LeaveRoom. Failed room {RoomId}, participant={pAttendeeSession.ParticipantId}, janus={janusReturnCode}, audiobridge={returnCode}, errorCode={errorCode}");
             }
             catch (Exception e)
             {
-                m_log.Error($"{LogHeader} LeaveRoom. Exception ", e);
+                m_log.ErrorFormat("{0} LeaveRoom. Exception {1}", LogHeader, e);
             }
-            return false;
+            return ret;
         }
+
     }
 }

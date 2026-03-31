@@ -25,12 +25,11 @@
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-using System;
 using System.Threading.Tasks;
 
 using OMV = OpenMetaverse;
 
-namespace osWebRtcVoice
+namespace WebRtcVoice
 {
     /// <summary>
     /// This is the interface for the viewer session. It is used to store the
@@ -38,16 +37,6 @@ namespace osWebRtcVoice
     /// </summary>
     public interface IVoiceViewerSession
     {
-        [Flags]
-        public enum VFlags: uint
-        {
-            None = 0,
-            IsParcel = 1,
-            IsEstate = IsParcel | 2,
-            IsAdmin = 4,
-            IsChildAgent = 8,
-        }
-
         // This ID is passed to and from the viewer to identify the session
         public string ViewerSessionID { get; set; }
         public IWebRtcVoiceService VoiceService { get; set; }
@@ -58,7 +47,6 @@ namespace osWebRtcVoice
 
         // The simulator has a GUID to identify the user
         public OMV.UUID AgentId { get; set; }
-        public VFlags Flags { get; set; }
 
         // Disconnect the connection to the voice service for this session
         public Task Shutdown();

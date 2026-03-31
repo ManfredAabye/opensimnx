@@ -25,20 +25,23 @@
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-using log4net;
-using Nini.Config;
-using OpenMetaverse;
-using OpenMetaverse.StructuredData;
-using OpenSim.Framework;
-using OpenSim.Services.Base;
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Collections.Concurrent;
 using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 
-namespace osWebRtcVoice
+using OpenSim.Framework;
+using OpenSim.Services.Base;
+
+using OpenMetaverse.StructuredData;
+using OpenMetaverse;
+
+using Nini.Config;
+using log4net;
+
+namespace WebRtcVoice
 {
     public class WebRtcJanusService : ServiceBase, IWebRtcVoiceService
     {
@@ -48,21 +51,20 @@ namespace osWebRtcVoice
         private readonly IConfigSource _Config;
         private bool _Enabled = false;
 
-        private string _JanusServerURI = string.Empty;
-        private string _JanusAPIToken = string.Empty;
-        private string _JanusAdminURI = string.Empty;
-        private string _JanusAdminToken = string.Empty;
+        private string _JanusServerURI = String.Empty;
+        private string _JanusAPIToken = String.Empty;
+        private string _JanusAdminURI = String.Empty;
+        private string _JanusAdminToken = String.Empty;
 
         private bool _JanusDebug = false;
         private bool _MessageDetails = false;
-
         // Maximum ICE candidates accepted from one VoiceSignalingRequest call.
         // <= 0 means no limit.
         private int _MaxSignalingCandidatesPerRequest = 20;
         // Delay between a disconnect and next join for same agent.
         private int _RejoinCooldownMs = 250;
 
-        private readonly ConcurrentDictionary<UUID, DateTime> _LastDisconnectByAgent = new();
+        private readonly ConcurrentDictionary<UUID, DateTime> _LastDisconnectByAgent = new ConcurrentDictionary<UUID, DateTime>();
         private long _VoiceFlowCounter;
 
         // An extra "viewer session" that is created initially. Used to verify the service
@@ -71,6 +73,12 @@ namespace osWebRtcVoice
 
         public WebRtcJanusService(IConfigSource pConfig) : base(pConfig)
         {
+            WebRtcDebugControl.ApplyFromConfig(pConfig);
+
+            Assembly assembly = Assembly.GetExecutingAssembly();
+            string version = assembly.GetName().Version?.ToString() ?? "unknown";
+
+            _log.DebugFormat("{0} WebRtcJanusService version {1}", LogHeader, version);
             _Config = pConfig;
             IConfig webRtcVoiceConfig = _Config.Configs["WebRtcVoice"];
 
@@ -80,24 +88,16 @@ namespace osWebRtcVoice
                 IConfig janusConfig = _Config.Configs["JanusWebRtcVoice"];
                 if (_Enabled && janusConfig is not null)
                 {
-                    _JanusServerURI = janusConfig.GetString("JanusGatewayURI", string.Empty);
-                    _JanusAPIToken = janusConfig.GetString("APIToken", string.Empty);
-                    _JanusAdminURI = janusConfig.GetString("JanusGatewayAdminURI", string.Empty);
-                    _JanusAdminToken = janusConfig.GetString("AdminAPIToken", string.Empty);
-
-                    if (string.IsNullOrEmpty(_JanusServerURI) || string.IsNullOrEmpty(_JanusAPIToken) ||
-                        string.IsNullOrEmpty(_JanusAdminURI) || string.IsNullOrEmpty(_JanusAdminToken))
-                    {
-                        _log.Error($"{LogHeader} JanusWebRtcVoice configuration section missing required fields");
-                        _Enabled = false;
-                        return;
-                    }
-
+                    _JanusServerURI = janusConfig.GetString("JanusGatewayURI", String.Empty);
+                    _JanusAPIToken = janusConfig.GetString("APIToken", String.Empty);
+                    _JanusAdminURI = janusConfig.GetString("JanusGatewayAdminURI", String.Empty);
+                    _JanusAdminToken = janusConfig.GetString("AdminAPIToken", String.Empty);
                     // Debugging options
                     _JanusDebug = janusConfig.GetBoolean("JanusDebug", false);
                     _MessageDetails = janusConfig.GetBoolean("MessageDetails", false);
-
                     _MaxSignalingCandidatesPerRequest = janusConfig.GetInt("MaxSignalingCandidatesPerRequest", 20);
+                    _RejoinCooldownMs = janusConfig.GetInt("RejoinCooldownMs", 250);
+
                     if (_MaxSignalingCandidatesPerRequest < 0)
                     {
                         _log.WarnFormat("{0} MaxSignalingCandidatesPerRequest < 0 ({1}), using 0 (unlimited)",
@@ -105,104 +105,117 @@ namespace osWebRtcVoice
                         _MaxSignalingCandidatesPerRequest = 0;
                     }
 
-                    _RejoinCooldownMs = janusConfig.GetInt("RejoinCooldownMs", 250);
                     if (_RejoinCooldownMs < 0)
                     {
                         _log.WarnFormat("{0} RejoinCooldownMs < 0 ({1}), using 0", LogHeader, _RejoinCooldownMs);
                         _RejoinCooldownMs = 0;
                     }
 
+                    if (String.IsNullOrEmpty(_JanusServerURI) || String.IsNullOrEmpty(_JanusAPIToken) ||
+                        String.IsNullOrEmpty(_JanusAdminURI) || String.IsNullOrEmpty(_JanusAdminToken))
+                    {
+                        _log.ErrorFormat("{0} JanusWebRtcVoice configuration section missing required fields", LogHeader);
+                        _Enabled = false;
+                    }
+
                     if (_Enabled)
                     {
-                        if(!StartConnectionToJanus())
-                        {
-                            _log.Error($"{LogHeader} failed connection to Janus Gateway. Disabled");
-                            _Enabled=false;
-                            return;
-                        }
+                        _log.DebugFormat("{0} Enabled", LogHeader);
+                        StartConnectionToJanus();
                         RegisterConsoleCommands();
-                        _log.Info($"{LogHeader} Enabled");
                     }
                 }
                 else
                 {
-                    _log.Error($"{LogHeader} No JanusWebRtcVoice configuration section");
+                    _log.ErrorFormat("{0} No JanusWebRtcVoice configuration section", LogHeader);
                     _Enabled = false;
                 }
             }
             else
             {
-                _log.Error($"{LogHeader} No WebRtcVoice configuration section");
+                _log.ErrorFormat("{0} No WebRtcVoice configuration section", LogHeader);
                 _Enabled = false;
             }
         }
 
+        // Start a thread to do the connection to the Janus server.
         // Here an initial session is created and then a handle to the audio bridge plugin
         //    is created for the console commands. Since webrtc PeerConnections that are created
         //    my Janus are per-session, the other sessions will be created by the viewer requests.
-        private bool StartConnectionToJanus()
+        private void StartConnectionToJanus()
         {
             _log.DebugFormat("{0} StartConnectionToJanus", LogHeader);
-            _ViewerSession = new JanusViewerSession(this);
-            //bad
-            return ConnectToSessionAndAudioBridge(_ViewerSession).Result;
+            Task.Run(async () =>
+            {
+                _ViewerSession = new JanusViewerSession(this);
+                await ConnectToSessionAndAudioBridge(_ViewerSession);
+            });
         }
 
-        private async Task<bool> ConnectToSessionAndAudioBridge(JanusViewerSession pViewerSession)
+        private async Task ConnectToSessionAndAudioBridge(JanusViewerSession pViewerSession)
         {
-            JanusSession janusSession = new(_JanusServerURI, _JanusAPIToken, _JanusAdminURI, _JanusAdminToken, _MessageDetails);
-            if (await janusSession.CreateSession().ConfigureAwait(false))
+            JanusSession janusSession = new JanusSession(_JanusServerURI, _JanusAPIToken, _JanusAdminURI, _JanusAdminToken, _JanusDebug, _MessageDetails);
+            if (await janusSession.CreateSession())
             {
                 _log.DebugFormat("{0} JanusSession created", LogHeader);
+                janusSession.OnDisconnect += Handle_Disconnect;
 
                 // Once the session is created, create a handle to the plugin for rooms
-                JanusAudioBridge audioBridge = new(janusSession);
+                JanusAudioBridge audioBridge = new JanusAudioBridge(janusSession);
+                janusSession.AddPlugin(audioBridge);
 
-                if (await audioBridge.Activate(_Config).ConfigureAwait(false))
+                pViewerSession.VoiceServiceSessionId = janusSession.SessionId;
+                pViewerSession.Session = janusSession;
+                pViewerSession.AudioBridge = audioBridge;
+
+                janusSession.OnHangup += Handle_Hangup;
+
+                if (await audioBridge.Activate(_Config))
                 {
-                    _log.Debug($"{LogHeader} AudioBridgePluginHandle created");
+                    _log.DebugFormat("{0} AudioBridgePluginHandle created", LogHeader);
                     // Requests through the capabilities will create rooms
-    
-                    janusSession.AddPlugin(audioBridge);
-                    pViewerSession.VoiceServiceSessionId = janusSession.SessionId;
-                    pViewerSession.Session = janusSession;
-                    pViewerSession.AudioBridge = audioBridge;
-                    janusSession.OnDisconnect += Handle_Hangup;
-                    janusSession.OnHangup += Handle_Hangup;
-
-                    return true;
                 }
-                _log.Error($"{LogHeader} JanusPluginHandle not created");
+                else
+                {
+                    _log.ErrorFormat("{0} JanusPluginHandle not created", LogHeader);
+                }
             }
-            _log.Error($"{LogHeader} JanusSession not created");
-            return false;
+            else
+            {
+                _log.ErrorFormat("{0} JanusSession not created", LogHeader);
+            }   
         }
 
         private void Handle_Hangup(EventResp pResp)
         {
             if (pResp is not null)
             {
-                string sessionId = pResp.sessionId;
-                _log.Debug($"{LogHeader} Handle_Hangup: {pResp.RawBody}, sessionId={sessionId}");
+                var sessionId = pResp.sessionId;
+                string reason = pResp.RawBody.TryGetString("reason", out string r) ? r : String.Empty;
+                if (_MessageDetails)
+                {
+                    _log.DebugFormat("{0} Handle_Hangup: {1}, sessionId={2}", LogHeader, pResp.RawBody.ToString(), sessionId);
+                }
+                else
+                {
+                    _log.DebugFormat("{0} Handle_Hangup: sessionId={1}, reason={2}", LogHeader, sessionId, reason);
+                }
                 if (VoiceViewerSession.TryGetViewerSessionByVSSessionId(sessionId, out IVoiceViewerSession viewerSession))
                 {
-                    // There is a viewer session associated with this session
-//                    DisconnectViewerSession(viewerSession as JanusViewerSession);
-
                     // A Janus hangup can happen during a normal room switch/re-offer cycle.
                     // Keep the viewer session alive and only clear the per-call state.
                     if (viewerSession is JanusViewerSession janusViewerSession)
                     {
                         janusViewerSession.ParticipantId = 0;
                         janusViewerSession.Answer = null;
-                        janusViewerSession.Offer = string.Empty;
-                        janusViewerSession.OfferOrig = string.Empty;
+                        janusViewerSession.Offer = String.Empty;
+                        janusViewerSession.OfferOrig = String.Empty;
                         janusViewerSession.Room = null;
                     }
                 }
                 else
                 {
-                    _log.Debug($"{LogHeader} Handle_Hangup: no session found. SessionId={sessionId}");
+                    _log.DebugFormat("{0} Handle_Hangup: no session found. SessionId={1}", LogHeader, sessionId);
                 }
             }
         }
@@ -212,23 +225,42 @@ namespace osWebRtcVoice
             if (pResp is null)
                 return;
 
-            if (VoiceViewerSession.TryGetViewerSessionByVSSessionId(pResp.sessionId, out IVoiceViewerSession viewerSession))
+            string sessionId = pResp.sessionId;
+            if (VoiceViewerSession.TryGetViewerSessionByVSSessionId(sessionId, out IVoiceViewerSession viewerSession))
             {
                 DisconnectViewerSession(viewerSession as JanusViewerSession, "disconnect");
             }
             else
             {
-                _log.DebugFormat("{0} Handle_Disconnect: no session found. SessionId={1}", LogHeader, pResp.sessionId);
+                _log.DebugFormat("{0} Handle_Disconnect: no session found. SessionId={1}", LogHeader, sessionId);
             }
         }
 
         private static string FlowTag(long pFlowId, JanusViewerSession pViewerSession)
         {
-            return $"flow={pFlowId}, viewer_session={pViewerSession?.ViewerSessionID ?? "<none>"}";
+            string vs = pViewerSession?.ViewerSessionID ?? "<none>";
+            return String.Format("flow={0}, viewer_session={1}", pFlowId, vs);
+        }
+
+        private async Task EnforceRejoinCooldown(UUID pAgentId, JanusViewerSession pViewerSession, long pFlowId)
+        {
+            if (_RejoinCooldownMs <= 0)
+                return;
+
+            if (_LastDisconnectByAgent.TryGetValue(pAgentId, out DateTime lastDisconnectUtc))
+            {
+                int elapsedMs = (int)(DateTime.UtcNow - lastDisconnectUtc).TotalMilliseconds;
+                int waitMs = _RejoinCooldownMs - elapsedMs;
+                if (waitMs > 0)
+                {
+                    _log.DebugFormat("{0} ProvisionVoiceAccountRequest: applying rejoin cooldown {1}ms ({2})",
+                            LogHeader, waitMs, FlowTag(pFlowId, pViewerSession));
+                    await Task.Delay(waitMs);
+                }
+            }
         }
 
         // Disconnect the viewer session. This is called when the viewer logs out or hangs up.
-
         private void DisconnectViewerSession(JanusViewerSession pViewerSession, string pReason)
         {
             if (pViewerSession is not null)
@@ -244,10 +276,9 @@ namespace osWebRtcVoice
                 _LastDisconnectByAgent[pViewerSession.AgentId] = DateTime.UtcNow;
                 _log.InfoFormat("{0} ProvisionVoiceAccountRequest: disconnected by {1}. agent={2}, scene={3}, room={4}, participant={5}, viewer_session={6}",
                         LogHeader, pReason, pViewerSession.AgentId, pViewerSession.RegionId, roomId, pViewerSession.ParticipantId, pViewerSession.ViewerSessionID);
- 
-                VoiceViewerSession.RemoveViewerSession(pViewerSession.ViewerSessionID);
                 Task.Run(() =>
                 {
+                    VoiceViewerSession.RemoveViewerSession(pViewerSession.ViewerSessionID);
                     // No need to wait for the session to be shutdown
                     _ = pViewerSession.Shutdown();
                 });
@@ -258,44 +289,25 @@ namespace osWebRtcVoice
         // This is the logic that takes the client's request and converts it into
         //     operations on rooms in the audio bridge.
         // IWebRtcVoiceService.ProvisionVoiceAccountRequest
-        public OSDMap ProvisionVoiceAccountRequest(IVoiceViewerSession pSession, OSDMap pRequest, UUID pUserID, UUID pSceneID)
+        public async Task<OSDMap> ProvisionVoiceAccountRequest(IVoiceViewerSession pSession, OSDMap pRequest, UUID pUserID, UUID pSceneID)
         {
-            return ProvisionVoiceAccountRequestBAD(pSession, pRequest, pUserID, pSceneID).Result;
-        }
-
-        public async Task<OSDMap> ProvisionVoiceAccountRequestBAD(IVoiceViewerSession pSession, OSDMap pRequest, UUID pUserID, UUID pSceneID)
-        {
-            long flowId = Interlocked.Increment(ref _VoiceFlowCounter);
-            if(pRequest.TryGetString("voice_server_type", out string voice_server_type))
-            {
-                if(!"webrtc".Equals(voice_server_type,StringComparison. CurrentCultureIgnoreCase))
-                {
-                    _log.Error($"{LogHeader} ProvisionVoiceAccountRequest: invalid server type {voice_server_type ?? "null"}");
-                    return new OSDMap
-                    {
-                        { "response", "failed" },
-                        { "error", "Invalid server type" }
-                    };
-                }
-            }
-
             OSDMap ret = null;
             string errorMsg = null;
             JanusViewerSession viewerSession = pSession as JanusViewerSession;
-
+            long flowId = Interlocked.Increment(ref _VoiceFlowCounter);
             if (viewerSession is not null)
             {
+                _log.DebugFormat("{0} ProvisionVoiceAccountRequest: begin ({1})", LogHeader, FlowTag(flowId, viewerSession));
+                if (viewerSession.Session is null)
+                {
+                    // This is a new session so we must create a new session and handle to the audio bridge
+                    await ConnectToSessionAndAudioBridge(viewerSession);
+                }
+
                 // TODO: need to keep count of users in a room to know when to close a room
-                bool isLogout = pRequest.TryGetBool("logout", out bool lgout) && lgout;
+                bool isLogout = pRequest.ContainsKey("logout") && pRequest["logout"].AsBoolean();
                 if (isLogout)
                 {
-                    // Exit the room.
-                    if (viewerSession.Room is not null)
-                    {
-                        _ = await viewerSession.Room.LeaveRoom(viewerSession).ConfigureAwait(false);
-                        viewerSession.Room = null;
-                    }
-
                     // The client is logging out. Disconnect the entire Janus viewer session.
                     DisconnectViewerSession(viewerSession, "logout");
                     return new OSDMap
@@ -304,68 +316,89 @@ namespace osWebRtcVoice
                     };
                 }
 
-                if (viewerSession.Session is null)
-                {
-                    // This is a new session so we must create a new session and handle to the audio bridge
-                    await ConnectToSessionAndAudioBridge(viewerSession).ConfigureAwait(false);
-                }
-
                 // Get the parameters that select the room
                 // To get here, voice_server_type has already been checked to be 'webrtc' and channel_type='local'
-                int parcel_local_id = pRequest.TryGetInt("parcel_local_id", out int pli) ? pli : JanusAudioBridge.REGION_ROOM_ID;
-                string channel_id = pRequest.TryGetString("channel_id", out string cli) ? cli : string.Empty;
-                string channel_credentials = pRequest.TryGetString("credentials", out string cred) ? cred : string.Empty;
+                int parcel_local_id = pRequest.ContainsKey("parcel_local_id") ? pRequest["parcel_local_id"].AsInteger() : JanusAudioBridge.REGION_ROOM_ID;
+                string channel_id = pRequest.ContainsKey("channel_id") ? pRequest["channel_id"].AsString() : String.Empty;
+                string channel_credentials = pRequest.ContainsKey("credentials") ? pRequest["credentials"].AsString() : String.Empty;
                 string channel_type = pRequest["channel_type"].AsString();
-                string gridHash = pRequest.TryGetValue("gridhash", out OSD ghash) ? ghash.AsString() : string.Empty;
                 bool isSpatial = channel_type == "local";
+                string voice_server_type = pRequest["voice_server_type"].AsString();
 
                 _log.DebugFormat("{0} ProvisionVoiceAccountRequest: parcel_id={1} channel_id={2} channel_type={3} voice_server_type={4}", LogHeader, parcel_local_id, channel_id, channel_type, voice_server_type); 
 
-                if (pRequest.TryGetOSDMap("jsep", out OSDMap jsep))
+                if (pRequest.ContainsKey("jsep") && pRequest["jsep"] is OSDMap jsep)
                 {
                     await viewerSession.ProvisionLock.WaitAsync();
-
                     try
                     {
-                        // The jsep is the SDP from the client. This is the client's request to connect to the audio bridge.
-                        string jsepType = jsep["type"].AsString();
-                        string jsepSdp = jsep["sdp"].AsString();
-                        if (jsepType == "offer")
+                    // The jsep is the SDP from the client. This is the client's request to connect to the audio bridge.
+                    string jsepType = jsep["type"].AsString();
+                    string jsepSdp = jsep["sdp"].AsString();
+                    if (jsepType == "offer")
+                    {
+                        // The client is sending an offer. Find the right room and join it.
+                        // _log.DebugFormat("{0} ProvisionVoiceAccountRequest: jsep type={1} sdp={2}", LogHeader, jsepType, jsepSdp);
+                        JanusRoom previousRoom = viewerSession.Room;
+                        JanusRoom selectedRoom = await viewerSession.AudioBridge.SelectRoom(pSceneID.ToString(),
+                                                            channel_type, isSpatial, parcel_local_id, channel_id);
+                        if (selectedRoom is null)
                         {
-                            // The client is sending an offer. Find the right room and join it.
-                            // _log.DebugFormat("{0} ProvisionVoiceAccountRequest: jsep type={1} sdp={2}", LogHeader, jsepType, jsepSdp);
-                            viewerSession.Room = await viewerSession.AudioBridge.SelectRoom(pSceneID.ToString(), gridHash,
-                                                                channel_type, isSpatial, parcel_local_id, channel_id, channel_credentials).ConfigureAwait(false);
-                            if (viewerSession.Room is null)
+                            errorMsg = "room selection failed";
+                            _log.ErrorFormat("{0} ProvisionVoiceAccountRequest: room selection failed", LogHeader);
+                        }
+                        else {
+                            if (previousRoom is not null && viewerSession.ParticipantId > 0)
                             {
-                                errorMsg = "room selection failed";
-                                _log.Error($"{LogHeader} ProvisionVoiceAccountRequest: room selection failed");
+                                _log.InfoFormat("{0} ProvisionVoiceAccountRequest: leaving existing participant {1} from room {2} before rejoin to room {3}",
+                                        LogHeader, viewerSession.ParticipantId, previousRoom.RoomId, selectedRoom.RoomId);
+                                await previousRoom.LeaveRoom(viewerSession);
+                                viewerSession.ParticipantId = 0;
                             }
-                            else
+
+                            await EnforceRejoinCooldown(pUserID, viewerSession, flowId);
+
+                            viewerSession.Room = selectedRoom;
+                            viewerSession.Offer = jsepSdp;
+                            viewerSession.OfferOrig = jsepSdp;
+                            viewerSession.AgentId = pUserID;
+                            if (await viewerSession.Room.JoinRoom(viewerSession))    
                             {
-                                viewerSession.Offer = jsepSdp;
-                                viewerSession.OfferOrig = jsepSdp;
-                                viewerSession.AgentId = pUserID;
-                                if (await viewerSession.Room.JoinRoom(viewerSession).ConfigureAwait(false))
+                                bool hasAnswerSdp =
+                                        viewerSession.Answer is not null &&
+                                        viewerSession.Answer.TryGetString("sdp", out string answerSdp) &&
+                                        !String.IsNullOrEmpty(answerSdp);
+
+                                if (!hasAnswerSdp)
                                 {
+                                    errorMsg = "JoinRoom without valid jsep/sdp";
+                                    _log.ErrorFormat("{0} ProvisionVoiceAccountRequest: JoinRoom returned without valid answer SDP. agent={1}, scene={2}, room={3}, participant={4}",
+                                            LogHeader, pUserID, pSceneID, viewerSession.Room.RoomId, viewerSession.ParticipantId);
+                                }
+                                else
+                                {
+                                    viewerSession.RegionId = pSceneID;
+                                    _log.InfoFormat("{0} ProvisionVoiceAccountRequest: connected. agent={1}, scene={2}, room={3}, participant={4}, viewer_session={5}",
+                                            LogHeader, pUserID, pSceneID, viewerSession.Room.RoomId, viewerSession.ParticipantId, viewerSession.ViewerSessionID);
                                     ret = new OSDMap
                                     {
                                         { "jsep", viewerSession.Answer },
                                         { "viewer_session", viewerSession.ViewerSessionID }
                                     };
                                 }
-                                else
-                                {
-                                    errorMsg = "JoinRoom failed";
-                                    _log.Error($"{LogHeader} ProvisionVoiceAccountRequest: JoinRoom failed");
-                                }
+                            }
+                            else
+                            {
+                                errorMsg = "JoinRoom failed";
+                                _log.ErrorFormat("{0} ProvisionVoiceAccountRequest: JoinRoom failed", LogHeader);
                             }
                         }
-                        else
-                        {
-                            errorMsg = "jsep type not offer";
-                            _log.Error($"{LogHeader} ProvisionVoiceAccountRequest: jsep type={jsepType} not offer");
-                        }
+                    }
+                    else
+                    {
+                        errorMsg = "jsep type not offer";
+                        _log.ErrorFormat("{0} ProvisionVoiceAccountRequest: jsep type={1} not offer", LogHeader, jsepType);
+                    }
                     }
                     finally
                     {
@@ -375,16 +408,16 @@ namespace osWebRtcVoice
                 else
                 {
                     errorMsg = "no jsep";
-                    _log.Debug($"{LogHeader} ProvisionVoiceAccountRequest: no jsep. req={pRequest}");
+                    _log.DebugFormat("{0} ProvisionVoiceAccountRequest: no jsep. req={1}", LogHeader, pRequest.ToString());
                 }
             }
             else
             {
                 errorMsg = "viewersession not JanusViewerSession";
-                _log.Error("{LogHeader} ProvisionVoiceAccountRequest: viewersession not JanusViewerSession");
+                _log.ErrorFormat("{0} ProvisionVoiceAccountRequest: viewersession not JanusViewerSession", LogHeader);
             }
 
-            if (!string.IsNullOrEmpty(errorMsg) && ret is null)
+            if (!String.IsNullOrEmpty(errorMsg) && ret is null)
             {
                 // The provision failed so build an error messgage to return
                 ret = new OSDMap
@@ -403,53 +436,48 @@ namespace osWebRtcVoice
         }
 
         // IWebRtcVoiceService.VoiceAccountBalanceRequest
-        public OSDMap VoiceSignalingRequest(IVoiceViewerSession pSession, OSDMap pRequest, UUID pUserID, UUID pSceneID)
-        {
-            return VoiceSignalingRequestBAD(pSession, pRequest, pUserID, pSceneID).Result;
-        }
-
-        public async Task<OSDMap> VoiceSignalingRequestBAD(IVoiceViewerSession pSession, OSDMap pRequest, UUID pUserID, UUID pSceneID)
+        public async Task<OSDMap> VoiceSignalingRequest(IVoiceViewerSession pSession, OSDMap pRequest, UUID pUserID, UUID pSceneID)
         {
             OSDMap ret = null;
             JanusViewerSession viewerSession = pSession as JanusViewerSession;
             JanusMessageResp resp = null;
             long flowId = Interlocked.Increment(ref _VoiceFlowCounter);
-            if (viewerSession is not null && viewerSession.Session is not null)
+            if (viewerSession is not null)
             {
+                _log.DebugFormat("{0} VoiceSignalingRequest: begin ({1})", LogHeader, FlowTag(flowId, viewerSession));
                 // The request should be an array of candidates
-                if (pRequest.TryGetOSDMap("candidate", out OSDMap candidate))
+                if (pRequest.ContainsKey("candidate") && pRequest["candidate"] is OSDMap candidate)
                 {
-                    if (candidate.TryGetValue("completed", out OSD ocompleted) && ocompleted.AsBoolean())
+                    if (candidate.ContainsKey("completed") && candidate["completed"].AsBoolean())
                     {
                         // The client has finished sending candidates
-                        resp = await viewerSession.Session.TrickleCompleted(viewerSession).ConfigureAwait(false);
-                        _log.Debug($"{LogHeader} VoiceSignalingRequest: candidate completed");
+                        resp = await viewerSession.Session.TrickleCompleted(viewerSession);
+                        _log.DebugFormat("{0} VoiceSignalingRequest: candidate completed", LogHeader);
                     }
                     else
                     {
-                        OSDArray candidatesArray =
-                        [
+                        OSDArray candidatesArray = new OSDArray
+                        {
                             new OSDMap()
                             {
                                 { "candidate", candidate.ContainsKey("candidate") ? candidate["candidate"].AsString() : String.Empty },
                                 { "sdpMid", candidate.ContainsKey("sdpMid") ? candidate["sdpMid"].AsString() : String.Empty },
                                 { "sdpMLineIndex", candidate.ContainsKey("sdpMLineIndex") ? candidate["sdpMLineIndex"].AsLong() : 0 }
                             }
-                        ];
-                        resp = await viewerSession.Session.TrickleCandidates(viewerSession, candidatesArray).ConfigureAwait(false);
-                        _log.Debug($"{LogHeader} VoiceSignalingRequest: single candidate");
+                        };
+                        resp = await viewerSession.Session.TrickleCandidates(viewerSession, candidatesArray);
+                        _log.DebugFormat("{0} VoiceSignalingRequest: single candidate", LogHeader);
                     }
                 }
-                else if (pRequest.TryGetOSDArray("candidates", out OSDArray candidates))
+                else if (pRequest.ContainsKey("candidates") && pRequest["candidates"] is OSDArray candidates)
                 {
-                    OSDArray candidatesArray = [];
-                    //int sourceCount = candidates.Count;
-                    //int candidateLimit = _MaxSignalingCandidatesPerRequest;
+                    OSDArray candidatesArray = new OSDArray();
+                    int sourceCount = candidates.Count;
+                    int candidateLimit = _MaxSignalingCandidatesPerRequest;
                     foreach (OSDMap cand in candidates)
                     {
-                        // TODO: can not limit candidates blindly
-//                        if (candidateLimit > 0 && candidatesArray.Count >= candidateLimit)
-//                            break;
+                        if (candidateLimit > 0 && candidatesArray.Count >= candidateLimit)
+                            break;
 
                         candidatesArray.Add(new OSDMap() {
                             { "candidate", cand["candidate"].AsString() },
@@ -457,25 +485,25 @@ namespace osWebRtcVoice
                             { "sdpMLineIndex", cand["sdpMLineIndex"].AsLong() }
                         });
                     }
-                    resp = await viewerSession.Session.TrickleCandidates(viewerSession, candidatesArray).ConfigureAwait(false);
-//                    if (candidateLimit > 0 && sourceCount > candidatesArray.Count)
-//                    {
-//                        _log.WarnFormat("{0} VoiceSignalingRequest: capped candidates {1}/{2} (MaxSignalingCandidatesPerRequest={3})",
-//                                LogHeader, candidatesArray.Count, sourceCount, candidateLimit);
-//                    }
-//                    else
-//                    {
+                    resp = await viewerSession.Session.TrickleCandidates(viewerSession, candidatesArray);
+                    if (candidateLimit > 0 && sourceCount > candidatesArray.Count)
+                    {
+                        _log.WarnFormat("{0} VoiceSignalingRequest: capped candidates {1}/{2} (MaxSignalingCandidatesPerRequest={3})",
+                                LogHeader, candidatesArray.Count, sourceCount, candidateLimit);
+                    }
+                    else
+                    {
                         _log.DebugFormat("{0} VoiceSignalingRequest: {1} candidates", LogHeader, candidatesArray.Count);
-//                    }
+                    }
                 }
                 else
                 {
-                    _log.Error($"{LogHeader} VoiceSignalingRequest: no 'candidate' or 'candidates'");
+                    _log.ErrorFormat("{0} VoiceSignalingRequest: no 'candidate' or 'candidates'", LogHeader);
                 }
             }
             if (resp is null)
             {
-                _log.Error($"{LogHeader} VoiceSignalingRequest: no response so returning error");
+                _log.ErrorFormat("{0} VoiceSignalingRequest: no response so returning error", LogHeader);
                 ret = new OSDMap
                 {
                     { "response", "error" }
@@ -485,19 +513,20 @@ namespace osWebRtcVoice
             {
                 ret = resp.RawBody;
             }
+            _log.DebugFormat("{0} VoiceSignalingRequest: end ({1})", LogHeader, FlowTag(flowId, viewerSession));
             return ret;
         }
 
         // This module should not be invoked with this signature
         // IWebRtcVoiceService.ProvisionVoiceAccountRequest
-        public OSDMap ProvisionVoiceAccountRequest(OSDMap pRequest, UUID pUserID, UUID pSceneID)
+        public Task<OSDMap> ProvisionVoiceAccountRequest(OSDMap pRequest, UUID pUserID, UUID pSceneID)
         {
             throw new NotImplementedException();
         }
 
         // This module should not be invoked with this signature
         // IWebRtcVoiceService.VoiceSignalingRequest
-        public OSDMap VoiceSignalingRequest(OSDMap pRequest, UUID pUserID, UUID pSceneID)
+        public Task<OSDMap> VoiceSignalingRequest(OSDMap pRequest, UUID pUserID, UUID pSceneID)
         {
             throw new NotImplementedException();
         }
@@ -541,7 +570,6 @@ namespace osWebRtcVoice
                     "janus room <roomId>",
                     "Show one room with participant details",
                     HandleJanusRoom);
-
                 // List rooms
                 // List participants in a room
             }
@@ -554,14 +582,13 @@ namespace osWebRtcVoice
             HandleJanusListSessions(module, cmdparms);
         }
 
-        private void HandleJanusInfo(string module, string[] cmdparms)
+        private async void HandleJanusInfo(string module, string[] cmdparms)
         {
             if (_ViewerSession is not null && _ViewerSession.Session is not null)
             {
                 WriteOut("{0} Janus session: {1}", LogHeader, _ViewerSession.Session.SessionId);
                 string infoURI = _ViewerSession.Session.JanusServerURI + "/info";
-
-                JanusMessageResp resp = _ViewerSession.Session.GetFromJanus(infoURI).Result;
+                var resp = await _ViewerSession.Session.GetFromJanus(infoURI);
                 if (resp is null)
                 {
                     WriteOut("{0} Failed to query Janus /info", LogHeader);
@@ -571,12 +598,10 @@ namespace osWebRtcVoice
                 bool requestJson = cmdparms is not null
                                    && cmdparms.Length > 2
                                    && cmdparms[2].Equals("json", StringComparison.OrdinalIgnoreCase);
- 
-                resp = _ViewerSession.Session.GetFromJanus(infoURI).Result;
 
                 if (requestJson)
                 {
-                     MainConsole.Instance.Output(resp.ToJson());
+                    MainConsole.Instance.Output(resp.ToJson());
                     return;
                 }
 
@@ -591,13 +616,13 @@ namespace osWebRtcVoice
             }
         }
 
-        private void HandleJanusShow(string module, string[] cmdparms)
+        private async void HandleJanusShow(string module, string[] cmdparms)
         {
             if (_ViewerSession is not null && _ViewerSession.Session is not null)
             {
                 WriteOut("{0} Janus session: {1}", LogHeader, _ViewerSession.Session.SessionId);
                 string infoURI = _ViewerSession.Session.JanusServerURI + "/info";
-                JanusMessageResp resp = _ViewerSession.Session.GetFromJanus(infoURI).Result;
+                var resp = await _ViewerSession.Session.GetFromJanus(infoURI);
                 if (resp is null)
                 {
                     WriteOut("{0} Failed to query Janus /info", LogHeader);
@@ -690,12 +715,12 @@ namespace osWebRtcVoice
             }
         }
 
-        private void HandleJanusListRooms(string module, string[] cmdparms)
+        private async void HandleJanusListRooms(string module, string[] cmdparms)
         {
             if (_ViewerSession is not null && _ViewerSession.Session is not null && _ViewerSession.AudioBridge is not null)
             {
-                JanusAudioBridge ab = _ViewerSession.AudioBridge;
-                AudioBridgeResp resp = ab.SendAudioBridgeMsg(new AudioBridgeListRoomsReq()).Result;
+                var ab = _ViewerSession.AudioBridge;
+                var resp = await ab.SendAudioBridgeMsg(new AudioBridgeListRoomsReq());
                 if (resp is not null && resp.isSuccess)
                 {
                     if (resp.PluginRespData.TryGetValue("list", out OSD list))
@@ -706,14 +731,11 @@ namespace osWebRtcVoice
                             "Room", "Description", "Num", "SampleRate", "Spatial", "Recording", "MappedSession");
                         foreach (OSDMap room in list as OSDArray)
                         {
-                            int roomid = room["room"].AsInteger();
                             MainConsole.Instance.Output(
                                 "  {0,10} {1,15} {2,5} {3,10} {4,7} {5,7}",
-                                roomid, room["description"], room["num_participants"],
+                                room["room"], room["description"], room["num_participants"],
                                 room["sampling_rate"], room["spatial_audio"], room["record"]);
-
-                            AudioBridgeResp participantResp = ab.SendAudioBridgeMsg(new AudioBridgeListParticipantsReq(roomid)).Result;
-
+                            var participantResp = await ab.SendAudioBridgeMsg(new AudioBridgeListParticipantsReq(room["room"].AsInteger()));
                             if (participantResp is not null && participantResp.AudioBridgeReturnCode == "participants")
                             {
                                 if (participantResp.PluginRespData.TryGetValue("participants", out OSD participants))
@@ -721,13 +743,14 @@ namespace osWebRtcVoice
                                     foreach (OSDMap participant in participants as OSDArray)
                                     {
                                         long participantId = participant.TryGetValue("id", out OSD participantIdNode)
-                                                ? participantIdNode.AsLong()
+                                                ? JanusMessage.OSDToLong(participantIdNode)
                                                 : 0L;
                                         string mapping = BuildParticipantMapping(participantId);
                                         MainConsole.Instance.Output("      {0}/{1},muted={2},talking={3},pos={4} {5}",
                                             participantId, participant["display"], participant["muted"],
                                             participant["talking"], participant["spatial_position"],
-                                            string.IsNullOrEmpty(mapping) ? "mapped=<none>" : mapping.Substring(2));                                    }
+                                            String.IsNullOrEmpty(mapping) ? "mapped=<none>" : mapping.Substring(2));
+                                    }
                                 }
                             }
                         }
@@ -749,7 +772,7 @@ namespace osWebRtcVoice
             if (_ViewerSession is null || _ViewerSession.Session is null)
                 return;
 
-            JanusMessageResp resp = await _ViewerSession.Session.SendToJanusAdmin(new JanusMessageReq("list_sessions")).ConfigureAwait(false);
+            var resp = await _ViewerSession.Session.SendToJanusAdmin(new JanusMessageReq("list_sessions"));
             if (resp is null)
             {
                 WriteOut("Failed to get sessions (no response)");
@@ -760,7 +783,7 @@ namespace osWebRtcVoice
             {
                 if (resp.isError)
                 {
-                    ErrorResp err = new(resp);
+                    var err = new ErrorResp(resp);
                     WriteOut("Failed to get sessions: {0} ({1})", err.errorReason, err.errorCode);
                 }
                 else
@@ -785,7 +808,7 @@ namespace osWebRtcVoice
             WriteOut("Active Janus sessions: {0}", sessions.Count);
             foreach (OSD session in sessions)
             {
-                string janusSessionId = session.AsLong().ToString();
+                string janusSessionId = session.AsString();
                 if (VoiceViewerSession.TryGetViewerSessionByVSSessionId(janusSessionId, out IVoiceViewerSession viewerSession))
                 {
                     WriteOut("  - {0}  viewer_session={1} agent={2} scene={3}",
@@ -812,8 +835,8 @@ namespace osWebRtcVoice
                 return;
             }
 
-            JanusAudioBridge ab = _ViewerSession.AudioBridge;
-            AudioBridgeResp roomsResp = await ab.SendAudioBridgeMsg(new AudioBridgeListRoomsReq()).ConfigureAwait(false);
+            var ab = _ViewerSession.AudioBridge;
+            var roomsResp = await ab.SendAudioBridgeMsg(new AudioBridgeListRoomsReq());
             if (roomsResp is null || !roomsResp.isSuccess || roomsResp.PluginRespData is null)
             {
                 WriteOut("Failed to get room list");
@@ -850,7 +873,7 @@ namespace osWebRtcVoice
             WriteOut("  Spatial     : {0}", GetMapString(foundRoom, "spatial_audio"));
             WriteOut("  Recording   : {0}", GetMapString(foundRoom, "record"));
 
-            AudioBridgeResp participantResp = await ab.SendAudioBridgeMsg(new AudioBridgeListParticipantsReq(roomId)).ConfigureAwait(false);
+            var participantResp = await ab.SendAudioBridgeMsg(new AudioBridgeListParticipantsReq(roomId));
             if (participantResp is null || participantResp.PluginRespData is null ||
                 !participantResp.PluginRespData.TryGetValue("participants", out OSD participantsNode) ||
                 participantsNode is not OSDArray participants)
@@ -869,7 +892,7 @@ namespace osWebRtcVoice
             foreach (OSDMap participant in participants)
             {
                 long participantId = participant.TryGetValue("id", out OSD participantIdNode)
-                        ? participantIdNode.AsLong()
+                        ? JanusMessage.OSDToLong(participantIdNode)
                         : 0L;
                 string mapping = BuildParticipantMapping(participantId);
                 WriteOut("    - {0}/{1}, muted={2}, talking={3}, pos={4}{5}",
@@ -893,7 +916,7 @@ namespace osWebRtcVoice
                 {
                     if (entry.Value is JanusViewerSession janusViewerSession && janusViewerSession.ParticipantId == participantId)
                     {
-                        return string.Format(", viewer_session={0}, agent={1}, scene={2}",
+                        return String.Format(", viewer_session={0}, agent={1}, scene={2}",
                                 entry.Key,
                                 entry.Value.AgentId,
                                 entry.Value.RegionId);
@@ -909,5 +932,7 @@ namespace osWebRtcVoice
             // m_log.InfoFormat(msg, args);
             MainConsole.Instance.Output(msg, args);
         }
+
+
     }
  }

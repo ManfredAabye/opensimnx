@@ -26,10 +26,12 @@
  */
 
 using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Text;
 using System.Security.Cryptography;
 
-namespace osWebRtcVoice
+namespace WebRtcVoice
 {
 
     // There are several different hashing systems ranging from int's to SHA versions.
