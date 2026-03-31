@@ -1,6 +1,13 @@
 Welcome to OpenSimulator Next Generation (osnx for short)!
 
-Cloned for OpenSimulator Next Generation
+It's already been applied:
+
+	Cloned for OpenSimulator Next Generation
+
+It will be added later:
+
+	SQL restructuring.
+	Removal of various old implementations.
 
 # Overview
 
