@@ -1,0 +1,18 @@
+# -----------------
+:VERSION 1
+
+BEGIN;
+
+CREATE TABLE IF NOT EXISTS `tsassets_index` (
+  `id` char(36) NOT NULL,
+  `assetType` tinyint(4) NOT NULL,
+  `updated_at` int(11) NOT NULL DEFAULT '0',
+  PRIMARY KEY (`id`),
+  INDEX `idx_tsassets_index_assetType` (`assetType`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8;
+
+-- Type tables are created dynamically at runtime
+-- using the same schema and name pattern: assets_<assetType>
+-- e.g. assets_1, assets_22, assets_-1, assets_-2.
+
+COMMIT;
