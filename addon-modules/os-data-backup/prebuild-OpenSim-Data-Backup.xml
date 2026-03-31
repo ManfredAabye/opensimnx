@@ -1,0 +1,33 @@
+<Project name="OpenSim.Addons.SqlDataBackup" path="addon-modules/os-data-backup" type="Library">
+	<Configuration name="Debug">
+		<Options>
+			<OutputPath>../../bin/</OutputPath>
+		</Options>
+	</Configuration>
+	<Configuration name="Release">
+		<Options>
+			<OutputPath>../../bin/</OutputPath>
+		</Options>
+	</Configuration>
+
+	<ReferencePath>../../bin/</ReferencePath>
+
+	<Reference name="Nini"/>
+	<Reference name="Mono.Addins"/>
+	<Reference name="MySql.Data"/>
+	<Reference name="log4net"/>
+	<Reference name="OpenMetaverse"/>
+	<Reference name="OpenMetaverseTypes"/>
+
+	<Reference name="OpenSim.Framework"/>
+	<Reference name="OpenSim.Framework.Serialization"/>
+	<Reference name="OpenSim.Framework.Servers.HttpServer"/>
+	<Reference name="OpenSim.Server.Handlers"/>
+
+	<Files>
+		<Match pattern="*.cs" recurse="true">
+			<Exclude name="obj" pattern="obj"/>
+			<Exclude pattern="Tests" />
+		</Match>
+	</Files>
+</Project>
