@@ -1,4 +1,4 @@
-Welcome to OpenSimulator (OpenSim for short)!
+Welcome to OpenSimulator Next Generation (osnx for short)!
 
 Cloned for OpenSimulator Next Generation
 
