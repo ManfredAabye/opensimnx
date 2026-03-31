@@ -1,5 +1,7 @@
 Welcome to OpenSimulator (OpenSim for short)!
 
+Cloned for OpenSimulator Next Generation
+
 # Overview
 
 OpenSim is a BSD Licensed Open Source project to develop a functioning
